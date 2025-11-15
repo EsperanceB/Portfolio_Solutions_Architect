@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'View Counter Microservice - Lambda function and DynamoDB table for tracking page views'
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: AWSPortfolio
+
+Resources:
+  # DynamoDB Table for View Counter
+  ViewCounterTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${EnvironmentName}-ViewCounter
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ViewCounter-Table
+
+  # IAM Role for Lambda
+  ViewCounterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ViewCounterLambda-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan  #(I wouldn't allow scans for cost optimization but this can be enforce in the lambda logic)
+                Resource: !GetAtt ViewCounterTable.Arn
+
+  # Lambda Function for View Counter
+  ViewsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-ViewsFunction
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt ViewCounterLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ViewCounterTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from decimal import Decimal
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          
+          def lambda_handler(event, context):
+              # CORS headers
+              headers = {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': '*',
+                  'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS'
+              }
+              
+              # Handle OPTIONS request for CORS preflight
+              if event.get('requestContext', {}).get('http', {}).get('method') == 'OPTIONS':
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({'message': 'CORS preflight'})
+                  }
+              
+              try:
+                  # Get the page ID from query parameters or default to 'home'
+                  page_id = 'home'
+                  if event.get('queryStringParameters'):
+                      page_id = event['queryStringParameters'].get('page', 'home')
+                  
+                  # Increment view count
+                  response = table.update_item(
+                      Key={'id': page_id},
+                      UpdateExpression='SET #views = if_not_exists(#views, :zero) + :inc',
+                      ExpressionAttributeNames={'#views': 'views'},
+                      ExpressionAttributeValues={':inc': 1, ':zero': 0},
+                      ReturnValues='UPDATED_NEW'
+                  )
+                  
+                  # Get the new count
+                  view_count = int(response['Attributes']['views'])
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'page': page_id,
+                          'views': view_count
+                      })
+                  }
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ViewsFunction
+
+  # Lambda Function URL
+  ViewsFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt ViewsFunction.Arn
+      Cors:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - OPTIONS
+        AllowHeaders:
+          - '*'
+        ExposeHeaders:
+          - '*'
+        MaxAge: 86400
+
+  # Permission for Lambda Function URL
+  ViewsFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ViewsFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+Outputs:
+  ViewsFunctionUrl:
+    Description: Function URL for Views Counter Lambda
+    Value: !GetAtt ViewsFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub ${EnvironmentName}-ViewsFunction-URL
+
+  ViewCounterTableName:
+    Description: Name of the DynamoDB table for view counter
+    Value: !Ref ViewCounterTable
+    Export:
+      Name: !Sub ${EnvironmentName}-ViewCounter-Table
+
+  ViewsFunctionArn:
+    Description: ARN of the Views Lambda function
+    Value: !GetAtt ViewsFunction.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-ViewsFunction-ARN
