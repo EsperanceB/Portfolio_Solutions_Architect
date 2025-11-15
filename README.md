@@ -4,11 +4,11 @@ As I progress in my journey toward becoming an AWS Machine Learning Specialist, 
 
 This repository is a showcase of my projects as a Solutions Architect Associate, where I highlight my expertise in AWS services through Infrastructure as Code (IaC), architecture design, and cloud solutions. My goal is to share knowledge, document my learning path, and contribute valuable content to the community.
 
-## 🎯 Project Overview
+##  Project Overview
 
 This repository contains a **production-ready AWS portfolio website** with a complete CloudFormation Infrastructure as Code (IaC) implementation. The project demonstrates advanced AWS architectural patterns, cost optimization strategies, and best practices for building scalable, secure cloud applications.
 
-## 🏗️ What I've Built
+##  What I've Built
 
 ### Complete CloudFormation Stack Suite (8 Stacks)
 
@@ -66,7 +66,7 @@ I've designed and implemented a comprehensive multi-tier AWS architecture using 
    - S3 bucket with encryption and versioning
    - **Reduces costs by ~95%** compared to server-based approach
 
-### 📐 Architecture Workflow
+###  Architecture Workflow
 
 #### **Stage 1: Server-Based Architecture Flow**
 
@@ -185,7 +185,7 @@ I've designed and implemented a comprehensive multi-tier AWS architecture using 
                           │ (Daily 9 AM)  │
                           └───────────────┘
 
-💡 Key Difference: No EC2, ALB, or NAT instances = 95% cost reduction
+ Key Difference: No EC2, ALB, or NAT instances = 95% cost reduction
 ```
 
 #### **Detailed Request Flow by Feature**
@@ -287,7 +287,7 @@ Layer 4: Access Control
 └── Security Groups (Port-specific rules)
 ```
 
-### 📐 Architecture Highlights
+###  Architecture Highlights
 
 - **High Availability**: Multi-AZ deployment across 2 availability zones
 - **Security Best Practices**: 
@@ -316,7 +316,7 @@ Layer 4: Access Control
 
 **Annual savings with full serverless migration: ~$600-700/year**
 
-## 📚 Technical Documentation
+##  Technical Documentation
 
 I've created comprehensive documentation including:
 
@@ -324,7 +324,7 @@ I've created comprehensive documentation including:
 - **[NAT-INSTANCE-MIGRATION.md](portfolio_website_cloudformation_stacks/NAT-INSTANCE-MIGRATION.md)** - Complete guide on cost optimization strategy, trade-offs, and migration process
 - **[README.md](portfolio_website_cloudformation_stacks/README.md)** - Deployment instructions, troubleshooting guide, and operational procedures
 
-## 🚀 Key Skills Demonstrated
+##  Key Skills Demonstrated
 
 - **Infrastructure as Code (IaC)**: CloudFormation templates with parameters, outputs, and cross-stack references
 - **AWS Services**: VPC, EC2, ALB, Auto Scaling, Lambda, DynamoDB, S3, CloudFront, Route53, SNS, EventBridge, IAM, CloudWatch
@@ -334,7 +334,7 @@ I've created comprehensive documentation including:
 - **DevOps**: Deployment automation, monitoring, logging, troubleshooting
 - **Cost Optimization**: Resource right-sizing, serverless migration, NAT Gateway alternatives
 
-## 📁 Repository Structure
+##  Repository Structure
 
 ```
 Portfolio_Solutions_Architect/
@@ -360,7 +360,7 @@ Portfolio_Solutions_Architect/
         └── 02-compute-params.json
 ```
 
-## 🎓 Learning Journey
+##  Learning Journey
 
 This project represents my practical application of AWS Solutions Architect Associate concepts including:
 
@@ -369,11 +369,11 @@ This project represents my practical application of AWS Solutions Architect Asso
 - ✅ Designing secure applications and architectures
 - ✅ Designing cost-optimized architectures
 
-## 🔄 Current Status
+##  Current Status
 
 **All 8 CloudFormation stacks are complete and fully documented**, ready for deployment. The project demonstrates a complete evolution from a traditional server-based architecture to a modern serverless approach, with detailed migration guides and cost analysis.
 
-## 📬 Next Steps
+##  Next Steps
 
 - Deploying the infrastructure to AWS
 - Creating blog content showcasing AWS architecture patterns
