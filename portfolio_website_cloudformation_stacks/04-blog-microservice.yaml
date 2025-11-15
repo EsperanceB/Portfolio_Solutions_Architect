@@ -1,0 +1,368 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Blog Microservice - S3 bucket, Lambda functions, and DynamoDB for blog post management'
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: AWSPortfolio
+
+Resources:
+  # S3 Bucket for Blog Post Uploads
+  BlogUploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-blog-uploads-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Function: !GetAtt CreatePostFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .txt
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-Blog-Upload-Bucket
+
+  # DynamoDB Table for Blog Posts
+  BlogPostsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${EnvironmentName}-BlogPosts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: postId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: N
+      KeySchema:
+        - AttributeName: postId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CreatedAtIndex
+          KeySchema:
+            - AttributeName: createdAt
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-BlogPosts-Table
+
+  # DynamoDB Table for Blog Post Views
+  BlogViewsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${EnvironmentName}-BlogViews
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: postId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: postId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-BlogViews-Table
+
+  # IAM Role for CreatePost Lambda
+  CreatePostLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-CreatePostLambda-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt BlogUploadBucket.Arn
+                  - !Sub ${BlogUploadBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt BlogPostsTable.Arn
+                  - !Sub ${BlogPostsTable.Arn}/index/*
+
+  # IAM Role for BlogViews Lambda
+  BlogViewsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-BlogViewsLambda-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt BlogPostsTable.Arn
+                  - !Sub ${BlogPostsTable.Arn}/index/*
+                  - !GetAtt BlogViewsTable.Arn
+
+  # Lambda Function to Create Blog Posts
+  CreatePostFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-CreatePostFunction
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt CreatePostLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          POSTS_TABLE: !Ref BlogPostsTable
+          BUCKET_NAME: !Ref BlogUploadBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime
+          
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          posts_table = dynamodb.Table(os.environ['POSTS_TABLE'])
+          
+          def lambda_handler(event, context):
+              try:
+                  # Get S3 event details
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = record['s3']['object']['key']
+                      
+                      # Read file content from S3
+                      response = s3.get_object(Bucket=bucket, Key=key)
+                      content = response['Body'].read().decode('utf-8')
+                      
+                      # Parse content (expecting format: title|content)
+                      lines = content.split('\n', 1)
+                      title = lines[0] if len(lines) > 0 else 'Untitled'
+                      body = lines[1] if len(lines) > 1 else ''
+                      
+                      # Create post item
+                      post_id = str(uuid.uuid4())
+                      timestamp = int(datetime.now().timestamp())
+                      
+                      posts_table.put_item(
+                          Item={
+                              'postId': post_id,
+                              'title': title,
+                              'content': body,
+                              'createdAt': timestamp,
+                              's3Key': key,
+                              'status': 'published'
+                          }
+                      )
+                      
+                      print(f"Created blog post: {post_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Blog post created successfully')
+                  }
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise e
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-CreatePostFunction
+
+  # Permission for S3 to invoke CreatePost Lambda
+  CreatePostFunctionS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreatePostFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt BlogUploadBucket.Arn
+
+  # Lambda Function for Blog Views
+  BlogViewsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-BlogViewsFunction
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt BlogViewsLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          POSTS_TABLE: !Ref BlogPostsTable
+          VIEWS_TABLE: !Ref BlogViewsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from boto3.dynamodb.conditions import Key
+          
+          dynamodb = boto3.resource('dynamodb')
+          posts_table = dynamodb.Table(os.environ['POSTS_TABLE'])
+          views_table = dynamodb.Table(os.environ['VIEWS_TABLE'])
+          
+          def lambda_handler(event, context):
+              # CORS headers
+              headers = {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': '*',
+                  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+              }
+              
+              # Handle OPTIONS request
+              if event.get('requestContext', {}).get('http', {}).get('method') == 'OPTIONS':
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({'message': 'CORS preflight'})
+                  }
+              
+              try:
+                  # Get all blog posts
+                  response = posts_table.scan()
+                  posts = response.get('Items', [])
+                  
+                  # Sort by createdAt (newest first)
+                  posts.sort(key=lambda x: x.get('createdAt', 0), reverse=True)
+                  
+                  # Get view counts for each post
+                  for post in posts:
+                      post_id = post['postId']
+                      views_response = views_table.get_item(Key={'postId': post_id})
+                      post['views'] = views_response.get('Item', {}).get('views', 0)
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'posts': posts
+                      }, default=str)
+                  }
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-BlogViewsFunction
+
+  # Lambda Function URL for BlogViews
+  BlogViewsFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt BlogViewsFunction.Arn
+      Cors:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - '*'
+        ExposeHeaders:
+          - '*'
+        MaxAge: 86400
+
+  # Permission for BlogViews Function URL
+  BlogViewsFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BlogViewsFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+Outputs:
+  BlogUploadBucketName:
+    Description: Name of the S3 bucket for blog uploads
+    Value: !Ref BlogUploadBucket
+    Export:
+      Name: !Sub ${EnvironmentName}-Blog-Upload-Bucket
+
+  BlogPostsTableName:
+    Description: Name of the DynamoDB table for blog posts
+    Value: !Ref BlogPostsTable
+    Export:
+      Name: !Sub ${EnvironmentName}-BlogPosts-Table
+
+  BlogViewsTableName:
+    Description: Name of the DynamoDB table for blog views
+    Value: !Ref BlogViewsTable
+    Export:
+      Name: !Sub ${EnvironmentName}-BlogViews-Table
+
+  BlogViewsFunctionUrl:
+    Description: Function URL for Blog Views Lambda
+    Value: !GetAtt BlogViewsFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub ${EnvironmentName}-BlogViewsFunction-URL
+
+  CreatePostFunctionArn:
+    Description: ARN of the CreatePost Lambda function
+    Value: !GetAtt CreatePostFunction.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-CreatePostFunction-ARN
+
+  BlogViewsFunctionArn:
+    Description: ARN of the BlogViews Lambda function
+    Value: !GetAtt BlogViewsFunction.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-BlogViewsFunction-ARN

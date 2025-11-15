@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Contact Form Microservice - Lambda function and SNS for contact form submissions'
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: AWSPortfolio
+
+  NotificationEmail:
+    Description: Email address to receive contact form notifications
+    Type: String
+    Default: your-email@example.com
+
+Resources:
+  # SNS Topic for Contact Form Notifications
+  ContactFormTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${EnvironmentName}-ContactForm-Topic
+      DisplayName: Contact Form Notifications
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ContactForm-Topic
+
+  # DynamoDB Table for Contact Form Submissions
+  ContactFormTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${EnvironmentName}-ContactFormSubmissions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: submissionId
+          AttributeType: S
+        - AttributeName: submittedAt
+          AttributeType: N
+      KeySchema:
+        - AttributeName: submissionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: SubmittedAtIndex
+          KeySchema:
+            - AttributeName: submittedAt
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ContactForm-Table
+
+  # IAM Role for Contact Form Lambda
+  ContactFormLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ContactFormLambda-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSDynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ContactFormTopic
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt ContactFormTable.Arn
+                  - !Sub ${ContactFormTable.Arn}/index/*
+
+  # Lambda Function for Contact Form
+  ContactFormFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-ContactFormFunction
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt ContactFormLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ContactFormTopic
+          TABLE_NAME: !Ref ContactFormTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime
+          
+          sns = boto3.client('sns')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          
+          def lambda_handler(event, context):
+              # CORS headers
+              headers = {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': '*',
+                  'Access-Control-Allow-Methods': 'POST, OPTIONS'
+              }
+              
+              # Handle OPTIONS request for CORS preflight
+              if event.get('requestContext', {}).get('http', {}).get('method') == 'OPTIONS':
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({'message': 'CORS preflight'})
+                  }
+              
+              try:
+                  # Parse request body
+                  if isinstance(event.get('body'), str):
+                      body = json.loads(event['body'])
+                  else:
+                      body = event.get('body', {})
+                  
+                  # Extract form data
+                  name = body.get('name', 'Unknown')
+                  email = body.get('email', 'No email provided')
+                  message = body.get('message', 'No message provided')
+                  
+                  # Validate required fields
+                  if not name or not email or not message:
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Missing required fields: name, email, message'})
+                      }
+                  
+                  # Generate unique submission ID
+                  submission_id = str(uuid.uuid4())
+                  timestamp = int(datetime.now().timestamp())
+                  
+                  # Store in DynamoDB
+                  table.put_item(
+                      Item={
+                          'submissionId': submission_id,
+                          'submittedAt': timestamp,
+                          'name': name,
+                          'email': email,
+                          'message': message,
+                          'status': 'received'
+                      }
+                  )
+                  
+                  # Send SNS notification
+                  sns_message = f"""
+                  New Contact Form Submission
+                  
+                  Submission ID: {submission_id}
+                  Name: {name}
+                  Email: {email}
+                  
+                  Message:
+                  {message}
+                  
+                  Submitted at: {datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')}
+                  """
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f'Contact Form Submission from {name}',
+                      Message=sns_message
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'message': 'Thank you for your submission!',
+                          'submissionId': submission_id
+                      })
+                  }
+              
+              except json.JSONDecodeError:
+                  return {
+                      'statusCode': 400,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Invalid JSON in request body'})
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ContactFormFunction
+
+  # Lambda Function URL
+  ContactFormFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt ContactFormFunction.Arn
+      Cors:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - '*'
+        ExposeHeaders:
+          - '*'
+        MaxAge: 86400
+
+  # Permission for Lambda Function URL
+  ContactFormFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ContactFormFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+Outputs:
+  ContactFormFunctionUrl:
+    Description: Function URL for Contact Form Lambda
+    Value: !GetAtt ContactFormFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub ${EnvironmentName}-ContactFormFunction-URL
+
+  ContactFormTopicArn:
+    Description: ARN of the SNS topic for contact form notifications
+    Value: !Ref ContactFormTopic
+    Export:
+      Name: !Sub ${EnvironmentName}-ContactFormTopic-ARN
+
+  ContactFormTableName:
+    Description: Name of the DynamoDB table for contact form submissions
+    Value: !Ref ContactFormTable
+    Export:
+      Name: !Sub ${EnvironmentName}-ContactForm-Table
+
+  ContactFormFunctionArn:
+    Description: ARN of the Contact Form Lambda function
+    Value: !GetAtt ContactFormFunction.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-ContactFormFunction-ARN

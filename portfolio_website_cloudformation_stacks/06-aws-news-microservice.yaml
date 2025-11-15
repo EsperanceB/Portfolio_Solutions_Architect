@@ -1,0 +1,378 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS News Microservice - Lambda function, DynamoDB, and EventBridge for AWS RSS feed updates'
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: AWSPortfolio
+
+  RSSFeedUrl:
+    Description: URL of the AWS RSS feed
+    Type: String
+    Default: https://aws.amazon.com/about-aws/whats-new/recent/feed/
+
+Resources:
+  # DynamoDB Table for AWS News
+  AWSNewsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${EnvironmentName}-AWSNews
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: newsId
+          AttributeType: S
+        - AttributeName: publishedDate
+          AttributeType: N
+      KeySchema:
+        - AttributeName: newsId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: PublishedDateIndex
+          KeySchema:
+            - AttributeName: publishedDate
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-AWSNews-Table
+
+  # IAM Role for RSS Lambda
+  RSSFetchLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-RSSFetchLambda-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt AWSNewsTable.Arn
+                  - !Sub ${AWSNewsTable.Arn}/index/*
+
+  # IAM Role for Update Webpage Lambda
+  UpdateWebpageLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-UpdateWebpageLambda-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt AWSNewsTable.Arn
+                  - !Sub ${AWSNewsTable.Arn}/index/*
+
+  # Lambda Layer for feedparser library
+  FeedparserLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${EnvironmentName}-feedparser-layer
+      Description: Feedparser library for parsing RSS feeds
+      Content:
+        S3Bucket: !Sub ${EnvironmentName}-lambda-layers-${AWS::AccountId}
+        S3Key: feedparser-layer.zip
+      CompatibleRuntimes:
+        - python3.11
+        - python3.10
+        - python3.9
+
+  # Lambda Function to Fetch RSS Feed
+  RSSFetchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-RSSFetchFunction
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt RSSFetchLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AWSNewsTable
+          RSS_FEED_URL: !Ref RSSFeedUrl
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import hashlib
+          from datetime import datetime, timedelta
+          from urllib.request import urlopen
+          from xml.etree import ElementTree
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          
+          def lambda_handler(event, context):
+              try:
+                  rss_url = os.environ['RSS_FEED_URL']
+                  
+                  # Fetch RSS feed
+                  with urlopen(rss_url) as response:
+                      content = response.read()
+                  
+                  # Parse XML
+                  root = ElementTree.fromstring(content)
+                  
+                  # Find all items
+                  items_processed = 0
+                  for item in root.findall('.//item')[:10]:  # Get latest 10 items
+                      title = item.find('title').text if item.find('title') is not None else 'No Title'
+                      link = item.find('link').text if item.find('link') is not None else ''
+                      description = item.find('description').text if item.find('description') is not None else ''
+                      pub_date = item.find('pubDate').text if item.find('pubDate') is not None else ''
+                      
+                      # Generate unique ID from title and link
+                      news_id = hashlib.md5(f"{title}{link}".encode()).hexdigest()
+                      
+                      # Parse published date
+                      try:
+                          pub_datetime = datetime.strptime(pub_date, '%a, %d %b %Y %H:%M:%S %z')
+                          pub_timestamp = int(pub_datetime.timestamp())
+                      except:
+                          pub_timestamp = int(datetime.now().timestamp())
+                      
+                      # Set TTL to 30 days from now
+                      ttl = int((datetime.now() + timedelta(days=30)).timestamp())
+                      
+                      # Store in DynamoDB
+                      table.put_item(
+                          Item={
+                              'newsId': news_id,
+                              'title': title,
+                              'link': link,
+                              'description': description,
+                              'publishedDate': pub_timestamp,
+                              'ttl': ttl,
+                              'fetchedAt': int(datetime.now().timestamp())
+                          }
+                      )
+                      
+                      items_processed += 1
+                  
+                  print(f"Processed {items_processed} RSS items")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'RSS feed processed successfully',
+                          'itemsProcessed': items_processed
+                      })
+                  }
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-RSSFetchFunction
+
+  # Lambda Function to Update Webpage
+  UpdateWebpageFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-UpdateWebpageFunction
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt UpdateWebpageLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AWSNewsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from boto3.dynamodb.conditions import Key, Attr
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          
+          def lambda_handler(event, context):
+              # CORS headers
+              headers = {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': '*',
+                  'Access-Control-Allow-Methods': 'GET, OPTIONS'
+              }
+              
+              # Handle OPTIONS request for CORS preflight
+              if event.get('requestContext', {}).get('http', {}).get('method') == 'OPTIONS':
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({'message': 'CORS preflight'})
+                  }
+              
+              try:
+                  # Get limit from query parameters (default to 10)
+                  limit = 10
+                  if event.get('queryStringParameters') and event['queryStringParameters'].get('limit'):
+                      try:
+                          limit = int(event['queryStringParameters']['limit'])
+                          limit = min(limit, 50)  # Max 50 items
+                      except:
+                          limit = 10
+                  
+                  # Scan table and get items
+                  response = table.scan(
+                      Limit=limit
+                  )
+                  
+                  items = response.get('Items', [])
+                  
+                  # Sort by published date (newest first)
+                  items.sort(key=lambda x: x.get('publishedDate', 0), reverse=True)
+                  
+                  # Format items for response
+                  news_items = []
+                  for item in items[:limit]:
+                      news_items.append({
+                          'title': item.get('title', 'No Title'),
+                          'link': item.get('link', ''),
+                          'description': item.get('description', ''),
+                          'publishedDate': item.get('publishedDate', 0)
+                      })
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'news': news_items,
+                          'count': len(news_items)
+                      }, default=str)
+                  }
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-UpdateWebpageFunction
+
+  # Lambda Function URL for UpdateWebpage
+  UpdateWebpageFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt UpdateWebpageFunction.Arn
+      Cors:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - OPTIONS
+        AllowHeaders:
+          - '*'
+        ExposeHeaders:
+          - '*'
+        MaxAge: 86400
+
+  # Permission for UpdateWebpage Function URL
+  UpdateWebpageFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UpdateWebpageFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  # EventBridge Rule to trigger RSS fetch daily at 9 AM UTC
+  RSSFetchScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${EnvironmentName}-RSSFetch-Schedule
+      Description: Trigger RSS fetch daily at 9 AM UTC
+      ScheduleExpression: cron(0 9 * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RSSFetchFunction.Arn
+          Id: RSSFetchTarget
+
+  # Permission for EventBridge to invoke Lambda
+  RSSFetchFunctionEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RSSFetchFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RSSFetchScheduleRule.Arn
+
+Outputs:
+  UpdateWebpageFunctionUrl:
+    Description: Function URL for Update Webpage Lambda
+    Value: !GetAtt UpdateWebpageFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub ${EnvironmentName}-UpdateWebpageFunction-URL
+
+  AWSNewsTableName:
+    Description: Name of the DynamoDB table for AWS news
+    Value: !Ref AWSNewsTable
+    Export:
+      Name: !Sub ${EnvironmentName}-AWSNews-Table
+
+  RSSFetchFunctionArn:
+    Description: ARN of the RSS Fetch Lambda function
+    Value: !GetAtt RSSFetchFunction.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-RSSFetchFunction-ARN
+
+  UpdateWebpageFunctionArn:
+    Description: ARN of the Update Webpage Lambda function
+    Value: !GetAtt UpdateWebpageFunction.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-UpdateWebpageFunction-ARN
+
+  EventBridgeRuleName:
+    Description: Name of the EventBridge rule for RSS fetch
+    Value: !Ref RSSFetchScheduleRule
+    Export:
+      Name: !Sub ${EnvironmentName}-RSSFetch-Rule

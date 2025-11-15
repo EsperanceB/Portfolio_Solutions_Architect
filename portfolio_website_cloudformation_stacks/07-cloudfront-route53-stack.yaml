@@ -1,0 +1,199 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFront and Route53 Stack - CDN distribution and DNS configuration'
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: AWSPortfolio
+
+  DomainName:
+    Description: Domain name for the website (e.g., example.com)
+    Type: String
+    Default: example.com
+
+  HostedZoneId:
+    Description: Route53 Hosted Zone ID (leave empty to create new)
+    Type: String
+    Default: ''
+
+  CreateHostedZone:
+    Description: Create a new Route53 Hosted Zone
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ACMCertificateArn:
+    Description: ARN of ACM certificate in us-east-1 (required for CloudFront)
+    Type: String
+    Default: ''
+
+Conditions:
+  CreateHostedZoneCondition: !Equals [!Ref CreateHostedZone, 'true']
+  HasHostedZoneId: !Not [!Equals [!Ref HostedZoneId, '']]
+  HasCertificate: !Not [!Equals [!Ref ACMCertificateArn, '']]
+
+Resources:
+  # Route53 Hosted Zone (Optional)
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Condition: CreateHostedZoneCondition
+    Properties:
+      Name: !Ref DomainName
+      HostedZoneConfig:
+        Comment: !Sub Hosted Zone for ${EnvironmentName}
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-HostedZone
+
+  # CloudFront Origin Access Control (OAC) for ALB
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${EnvironmentName}-OAC
+        OriginAccessControlOriginType: custom
+        SigningBehavior: never
+        SigningProtocol: sigv4
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${EnvironmentName} CloudFront Distribution
+        Aliases: !If
+          - HasCertificate
+          - - !Ref DomainName
+            - !Sub www.${DomainName}
+          - !Ref AWS::NoValue
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: ALBOrigin
+            DomainName:
+              Fn::ImportValue: !Sub ${EnvironmentName}-ALB-DNS
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+              OriginSSLProtocols:
+                - TLSv1.2
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 5
+            ConnectionAttempts: 3
+            ConnectionTimeout: 10
+        DefaultCacheBehavior:
+          TargetOriginId: ALBOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          Compress: true
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: all
+            Headers:
+              - Host
+              - Origin
+              - Access-Control-Request-Method
+              - Access-Control-Request-Headers
+          MinTTL: 0
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+        ViewerCertificate: !If
+          - HasCertificate
+          - AcmCertificateArn: !Ref ACMCertificateArn
+            MinimumProtocolVersion: TLSv1.2_2021
+            SslSupportMethod: sni-only
+          - CloudFrontDefaultCertificate: true
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-CloudFront
+
+  # Route53 Record for Root Domain
+  RootDomainRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasCertificate
+    Properties:
+      HostedZoneId: !If
+        - CreateHostedZoneCondition
+        - !Ref HostedZone
+        - !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        HostedZoneId: Z2FDTNDATAQYW2  # CloudFront Hosted Zone ID
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        EvaluateTargetHealth: false
+
+  # Route53 Record for WWW subdomain
+  WWWDomainRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasCertificate
+    Properties:
+      HostedZoneId: !If
+        - CreateHostedZoneCondition
+        - !Ref HostedZone
+        - !Ref HostedZoneId
+      Name: !Sub www.${DomainName}
+      Type: A
+      AliasTarget:
+        HostedZoneId: Z2FDTNDATAQYW2  # CloudFront Hosted Zone ID
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        EvaluateTargetHealth: false
+
+Outputs:
+  CloudFrontDistributionId:
+    Description: CloudFront Distribution ID
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub ${EnvironmentName}-CloudFront-ID
+
+  CloudFrontDomainName:
+    Description: CloudFront Distribution Domain Name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub ${EnvironmentName}-CloudFront-Domain
+
+  HostedZoneId:
+    Description: Route53 Hosted Zone ID
+    Value: !If
+      - CreateHostedZoneCondition
+      - !Ref HostedZone
+      - !Ref HostedZoneId
+    Export:
+      Name: !Sub ${EnvironmentName}-HostedZone-ID
+
+  WebsiteURL:
+    Description: Website URL
+    Value: !If
+      - HasCertificate
+      - !Sub https://${DomainName}
+      - !Sub https://${CloudFrontDistribution.DomainName}
+    Export:
+      Name: !Sub ${EnvironmentName}-Website-URL

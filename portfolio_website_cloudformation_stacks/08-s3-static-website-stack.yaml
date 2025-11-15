@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'S3 Static Website Stack (Stage 2) - Serverless website hosting with CloudFront'
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: AWSPortfolio
+
+  DomainName:
+    Description: Domain name for the website (e.g., example.com)
+    Type: String
+    Default: example.com
+
+  HostedZoneId:
+    Description: Route53 Hosted Zone ID for the domain
+    Type: String
+    Default: ''
+
+  ACMCertificateArn:
+    Description: ARN of ACM certificate in us-east-1 (required for CloudFront)
+    Type: String
+    Default: ''
+
+Conditions:
+  HasHostedZoneId: !Not [!Equals [!Ref HostedZoneId, '']]
+  HasCertificate: !Not [!Equals [!Ref ACMCertificateArn, '']]
+
+Resources:
+  # S3 Bucket for Static Website
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-website-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-Website-Bucket
+
+  # S3 Bucket Policy for CloudFront OAC
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${WebsiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${StaticWebsiteDistribution}
+
+  # CloudFront Origin Access Control for S3
+  StaticWebsiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${EnvironmentName}-Static-OAC
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # CloudFront Distribution for Static Website
+  StaticWebsiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${EnvironmentName} Static Website Distribution
+        Aliases: !If
+          - HasCertificate
+          - - !Ref DomainName
+            - !Sub www.${DomainName}
+          - !Ref AWS::NoValue
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !Ref StaticWebsiteOAC
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          MinTTL: 0
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+        CacheBehaviors:
+          # Cache behavior for CSS
+          - PathPattern: '*.css'
+            TargetOriginId: S3Origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            ForwardedValues:
+              QueryString: false
+              Cookies:
+                Forward: none
+            MinTTL: 0
+            DefaultTTL: 2592000
+            MaxTTL: 31536000
+          # Cache behavior for JavaScript
+          - PathPattern: '*.js'
+            TargetOriginId: S3Origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            ForwardedValues:
+              QueryString: false
+              Cookies:
+                Forward: none
+            MinTTL: 0
+            DefaultTTL: 2592000
+            MaxTTL: 31536000
+          # Cache behavior for Images
+          - PathPattern: '*.png'
+            TargetOriginId: S3Origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            ForwardedValues:
+              QueryString: false
+              Cookies:
+                Forward: none
+            MinTTL: 0
+            DefaultTTL: 2592000
+            MaxTTL: 31536000
+        ViewerCertificate: !If
+          - HasCertificate
+          - AcmCertificateArn: !Ref ACMCertificateArn
+            MinimumProtocolVersion: TLSv1.2_2021
+            SslSupportMethod: sni-only
+          - CloudFrontDefaultCertificate: true
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-Static-CloudFront
+
+  # Route53 Record for Root Domain (Static)
+  StaticRootDomainRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasCertificate
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        HostedZoneId: Z2FDTNDATAQYW2  # CloudFront Hosted Zone ID
+        DNSName: !GetAtt StaticWebsiteDistribution.DomainName
+        EvaluateTargetHealth: false
+
+  # Route53 Record for WWW subdomain (Static)
+  StaticWWWDomainRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasCertificate
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub www.${DomainName}
+      Type: A
+      AliasTarget:
+        HostedZoneId: Z2FDTNDATAQYW2  # CloudFront Hosted Zone ID
+        DNSName: !GetAtt StaticWebsiteDistribution.DomainName
+        EvaluateTargetHealth: false
+
+  # IAM Role for S3 Deployment
+  S3DeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-S3Deployment-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - ec2.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3DeploymentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt WebsiteBucket.Arn
+                  - !Sub ${WebsiteBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${StaticWebsiteDistribution}
+
+Outputs:
+  WebsiteBucketName:
+    Description: Name of the S3 bucket for static website
+    Value: !Ref WebsiteBucket
+    Export:
+      Name: !Sub ${EnvironmentName}-Static-Website-Bucket
+
+  StaticWebsiteDistributionId:
+    Description: CloudFront Distribution ID for static website
+    Value: !Ref StaticWebsiteDistribution
+    Export:
+      Name: !Sub ${EnvironmentName}-Static-CloudFront-ID
+
+  StaticWebsiteDistributionDomain:
+    Description: CloudFront Distribution Domain Name for static website
+    Value: !GetAtt StaticWebsiteDistribution.DomainName
+    Export:
+      Name: !Sub ${EnvironmentName}-Static-CloudFront-Domain
+
+  StaticWebsiteURL:
+    Description: Static Website URL
+    Value: !If
+      - HasCertificate
+      - !Sub https://${DomainName}
+      - !Sub https://${StaticWebsiteDistribution.DomainName}
+    Export:
+      Name: !Sub ${EnvironmentName}-Static-Website-URL
+
+  S3DeploymentRoleArn:
+    Description: ARN of the S3 Deployment Role
+    Value: !GetAtt S3DeploymentRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-S3Deployment-Role-ARN
+
+  DeploymentCommand:
+    Description: AWS CLI command to upload website files
+    Value: !Sub aws s3 sync ./website s3://${WebsiteBucket}/ --delete
